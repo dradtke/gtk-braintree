@@ -77,6 +77,204 @@ class CreditCardExpiryEntry : Gtk.Entry {
 	}
 }
 
+class CreditCardWindow : Gtk.Overlay {
+	private Gtk.InfoBar? infobar;
+	private uint? infobarTimeout;
+
+	public CreditCardWindow(Braintree bt) {
+		var grid = new Gtk.Grid();
+
+		var payment_methods_box = new Gtk.Box(Gtk.Orientation.VERTICAL, 6);
+		var enter_new_card = new Gtk.Button.with_label("Add New Card");
+		payment_methods_box.pack_end(enter_new_card, false, false, 6);
+
+		var new_credit_card_box = new Gtk.Box(Gtk.Orientation.VERTICAL, 6);
+		var credit_card = new CreditCard();
+		var new_payment_method_back = new Gtk.Button.from_icon_name("go-previous");
+		new_credit_card_box.pack_start(new_payment_method_back, false, false, 6);
+		new_credit_card_box.pack_start(credit_card, false, false, 6);
+
+		var payment_stack = new Gtk.Stack();
+		payment_stack.add_named(new Gtk.Label("Initializing..."), "loading");
+		payment_stack.add_named(payment_methods_box, "payment_methods");
+		payment_stack.add_named(new_credit_card_box, "new_card");
+		payment_stack.add_named(new Gtk.Label("Thank you for your payment!"), "finished");
+
+		var submit = new Gtk.Button.with_label("Pay $100");
+		submit.get_style_context().add_class("suggested-action");
+
+		grid.attach(payment_stack, 0, 1, 1, 6);
+		this.add(grid);
+		/*
+		var window_box = new Gtk.Box(Gtk.Orientation.VERTICAL, 6);
+		window_box.margin_start = 18;
+		window_box.margin_end = 18;
+		window_box.pack_start(payment_stack);
+		*/
+
+		var using_new_payment_method = false;
+
+		NonceHandler transact = (nonce) => {
+			var sale = Sale() {
+				nonce = nonce,
+				amount = "100"
+			};
+			bt.transaction.sale.begin(&sale, (obj, resp) => {
+				try {
+					var transaction_id = bt.transaction.sale.end(resp);
+					stdout.printf("transaction id: %s\n", transaction_id);
+					payment_stack.set_visible_child_name("finished");
+					submit.set_visible(false);
+				}
+				catch (ApiError e) {
+					display_message(Gtk.MessageType.ERROR, e.message, true);
+				}
+				catch (Error e) {
+					display_message(Gtk.MessageType.ERROR, "An unexpected error occurred: " + e.message, true);
+				}
+				finally {
+					submit.set_sensitive(true);
+				}
+			});
+		};
+
+		submit.clicked.connect(() => {
+			submit.set_sensitive(false);
+			credit_card.set_sensitive(false);
+			if (using_new_payment_method) {
+				// Create a new credit card.
+				bt.create_credit_card.begin(credit_card.parameters, (obj, resp) => {
+					credit_card.clear_errors();
+
+					try {
+						var result = bt.create_credit_card.end(resp);
+						if (result.success) {
+							transact(result.nonce);
+						} else {
+							display_message(Gtk.MessageType.ERROR, "Review the errors and try again.", false);
+							stdout.printf("No dice.\n");
+							result.errors.@foreach((error) => {
+								credit_card.show_error(error.field, error.message);
+								return true;
+							});
+							submit.set_sensitive(true);
+							credit_card.set_sensitive(true);
+						}
+					}
+					catch (Error e) {
+						display_message(Gtk.MessageType.ERROR, "An error occurred: " + e.message, true);
+						submit.set_sensitive(true);
+						credit_card.set_sensitive(true);
+					}
+				});
+			} else {
+				// Use an existing payment method.
+				for (var i = 0; i < bt.payment_methods.length; i++) {
+					if (bt.payment_method_buttons[i].active) {
+						transact(bt.payment_methods[i].nonce);
+						break;
+					}
+				}
+			}
+		});
+
+		bt.init.begin(GLib.Environment.get_variable("CUSTOMER_ID"), (obj, resp) => {
+			try {
+				bt.init.end(resp);
+				bt.payment_method_buttons = new Gtk.RadioButton[bt.payment_methods.length];
+				for (var i = 0; i < bt.payment_methods.length; i++) {
+					var is_default = bt.payment_methods[i].is_default;
+					var btn = new Gtk.RadioButton.with_label_from_widget(
+						bt.payment_method_buttons[0],
+						bt.payment_methods[i].type + " " + bt.payment_methods[i].description + (is_default ? " (default)" : "")
+					);
+					btn.set_always_show_image(true);
+					btn.set_image_position(Gtk.PositionType.LEFT);
+					switch (bt.payment_methods[i].type) {
+						case "CreditCard":
+							switch (bt.payment_methods[i].card_type) {
+								case "Discover":
+									btn.set_image(CreditCardLogo.discover());
+									break;
+								case "Visa":
+									btn.set_image(CreditCardLogo.visa());
+									break;
+								case "MasterCard":
+									btn.set_image(CreditCardLogo.mastercard());
+									break;
+								case "JCB":
+									btn.set_image(CreditCardLogo.jcb());
+									break;
+								case "American Express":
+									btn.set_image(CreditCardLogo.amex());
+									break;
+								default:
+									stderr.printf("unknown credit card type: %s\n", bt.payment_methods[i].card_type);
+									break;
+							}
+							break;
+					}
+					payment_methods_box.pack_start(btn, false, false, 0);
+					btn.set_active(bt.payment_methods[i].is_default);
+					bt.payment_method_buttons[i] = btn;
+				}
+				payment_methods_box.valign = Gtk.Align.CENTER;
+				grid.attach_next_to(submit, payment_stack, Gtk.PositionType.BOTTOM, 3, 1);
+				this.show_all();
+
+				credit_card.set_challenges(bt.challenges);
+				payment_stack.set_visible_child_name("payment_methods");
+				enter_new_card.clicked.connect(() => {
+					using_new_payment_method = true;
+					payment_stack.set_visible_child_name("new_card");
+				});
+				new_payment_method_back.clicked.connect(() => {
+					using_new_payment_method = false;
+					payment_stack.set_visible_child_name("payment_methods");
+				});
+			}
+			catch (Error e) {
+				display_message(Gtk.MessageType.ERROR, "An error occurred: " + e.message, true);
+			}
+		});
+	}
+
+	void display_message(Gtk.MessageType message_type, string message, bool sticky) {
+		if (infobar != null) {
+			infobar.close();
+		}
+		if (infobarTimeout != null) {
+			GLib.Source.remove(infobarTimeout);
+			infobarTimeout = null;
+		}
+
+		infobar = new Gtk.InfoBar();
+		infobar.set_valign(Gtk.Align.START);
+		infobar.set_message_type(message_type);
+		infobar.get_content_area().add(new Gtk.Label(message));
+		infobar.set_show_close_button(true);
+		infobar.response.connect((response_id) => {
+			switch (response_id) {
+				case Gtk.ResponseType.CLOSE:
+					this.remove(infobar);
+					break;
+			}
+		});
+		infobar.close.connect(() => {
+			this.remove(infobar);
+		});
+		this.add_overlay(infobar);
+		infobar.show_all();
+
+		if (!sticky) {
+			infobarTimeout = GLib.Timeout.add(5000, () => {
+				infobar.close();
+				return false;
+			});
+		}
+	}
+}
+
 class CreditCard : Gtk.Frame {
 	private Gtk.Grid grid;
 
@@ -138,6 +336,7 @@ class CreditCard : Gtk.Frame {
 
 	public void set_challenges(string[] challenges) {
 		for (var i = 0; i < challenges.length; i++) {
+			stdout.printf("found challenge: %s\n", challenges[i]);
 			var y = i + 2;
 			switch (challenges[i]) {
 				case "cvv":
@@ -165,12 +364,16 @@ class CreditCard : Gtk.Frame {
 		switch (field) {
 			case "number":
 				this.number_entry.get_style_context().add_class("error");
+				this.number_entry.set_icon_from_icon_name(Gtk.EntryIconPosition.SECONDARY, "dialog-error");
+				this.number_entry.set_tooltip_text(message);
 				break;
 
 			case "expirationYear":
 			case "expirationMonth":
 			case "expirationDate":
 				this.expiry_entry.get_style_context().add_class("error");
+				this.expiry_entry.set_icon_from_icon_name(Gtk.EntryIconPosition.SECONDARY, "dialog-error");
+				this.expiry_entry.set_tooltip_text(message);
 				break;
 
 			default:
@@ -181,6 +384,8 @@ class CreditCard : Gtk.Frame {
 
 	public void clear_errors() {
 		this.number_entry.get_style_context().remove_class("error");
+		this.number_entry.set_icon_from_icon_name(Gtk.EntryIconPosition.SECONDARY, null);
+		this.number_entry.set_tooltip_text(null);
 		this.expiry_entry.get_style_context().remove_class("error");
 	}
 }
@@ -544,6 +749,7 @@ class Braintree {
 	}
 
 	// This is just here for debugging purposes.
+	/*
 	public async string read_whole_stream(InputStream stream) throws Error {
 		var buffer = new uint8[4096];
 		var array = new ByteArray();
@@ -553,16 +759,13 @@ class Braintree {
 		}
 		return (string)array.data;
 	}
+	*/
 
 	protected struct ApiResult {
 		uint status_code;
 		string? content_type;
 		InputStream stream;
 	}
-}
-
-errordomain UsageError {
-	NOT_DEFINED
 }
 
 errordomain ApiError {
@@ -572,25 +775,6 @@ errordomain ApiError {
 }
 
 delegate void NonceHandler(string nonce);
-
-void display_message(Gtk.Box window_top_box, Gtk.MessageType message_type, string message) {
-	var infobar = new Gtk.InfoBar();
-	infobar.set_message_type(message_type);
-	infobar.get_content_area().add(new Gtk.Label(message));
-	infobar.set_show_close_button(true);
-	infobar.response.connect((response_id) => {
-		switch (response_id) {
-			case Gtk.ResponseType.CLOSE:
-				window_top_box.remove(infobar);
-				break;
-		}
-	});
-	infobar.close.connect(() => {
-		window_top_box.remove(infobar);
-	});
-	window_top_box.pack_start(infobar);
-	infobar.show_all();
-}
 
 int main(string[] args) {
 	Braintree.Environment? environment = null;
@@ -602,13 +786,33 @@ int main(string[] args) {
 			environment = Braintree.Environment.PRODUCTION;
 			break;
 		default:
-			throw new UsageError.NOT_DEFINED("environment variable `ENVIRONMENT' invalid or not defined");
+			stderr.printf("error: environment variable `ENVIRONMENT' not defined\n");
+			return 1;
 	}
+
+	var merchant_id = GLib.Environment.get_variable("MERCHANT_ID");
+	if (merchant_id == null) {
+		stderr.printf("error: environment variable `MERCHANT_ID' not defined\n");
+		return 1;
+	}
+
+	var public_key = GLib.Environment.get_variable("PUBLIC_KEY");
+	if (public_key == null) {
+		stderr.printf("error: environment variable `PUBLIC_KEY' not defined\n");
+		return 1;
+	}
+
+	var private_key = GLib.Environment.get_variable("PRIVATE_KEY");
+	if (private_key == null) {
+		stderr.printf("error: environment variable `PRIVATE_KEY' not defined\n");
+		return 1;
+	}
+
 	var bt = new Braintree(
-		environment,
-		GLib.Environment.get_variable("MERCHANT_ID"),
-		GLib.Environment.get_variable("PUBLIC_KEY"),
-		GLib.Environment.get_variable("PRIVATE_KEY")
+		(!) environment,
+		(!) merchant_id,
+		(!) public_key,
+		(!) private_key
 	);
 
 	Gtk.init(ref args);
@@ -620,162 +824,14 @@ int main(string[] args) {
 	window.window_position = Gtk.WindowPosition.CENTER;
 	window.destroy.connect(Gtk.main_quit);
 
-	var payment_methods_box = new Gtk.Box(Gtk.Orientation.VERTICAL, 6);
-	//var enter_new_card = new Gtk.Button.from_icon_name("list-add");
-	var enter_new_card = new Gtk.Button.with_label("Add New Card");
-	// payment_methods_box.pack_start(new Gtk.Label("Payment Methods"), false, false, 6);
-	payment_methods_box.pack_end(enter_new_card, false, false, 6);
-
-	var new_credit_card_box = new Gtk.Box(Gtk.Orientation.VERTICAL, 6);
-	var credit_card = new CreditCard();
-	var new_payment_method_back = new Gtk.Button.from_icon_name("go-previous");
-	new_credit_card_box.pack_start(new_payment_method_back, false, false, 6);
-	new_credit_card_box.pack_start(credit_card, false, false, 6);
-
-	var payment_stack = new Gtk.Stack();
-	payment_stack.add_named(new Gtk.Label("Initializing..."), "loading");
-	payment_stack.add_named(payment_methods_box, "payment_methods");
-	payment_stack.add_named(new_credit_card_box, "new_card");
-
-	var amount = new Gtk.Entry();
-	var submit_box = new Gtk.Box(Gtk.Orientation.HORIZONTAL, 6);
-	var submit = new Gtk.Button.with_label("Submit");
-	amount.text = "100"; // DELETEME
-	amount.placeholder_text = "Transaction Amount";
-	submit.get_style_context().add_class("suggested-action");
-	submit_box.pack_start(amount, true, true, 6);
-	submit_box.pack_end(submit, false, false, 6);
-
-	var window_box = new Gtk.Box(Gtk.Orientation.VERTICAL, 6);
-	window_box.margin_start = 18;
-	window_box.margin_end = 18;
-	window_box.pack_start(payment_stack);
-	window_box.pack_start(new Gtk.Separator(Gtk.Orientation.HORIZONTAL));
 	var window_top_box = new Gtk.Box(Gtk.Orientation.VERTICAL, 6);
-	window_top_box.pack_end(window_box);
+	window_top_box.pack_end(new CreditCardWindow(bt));
 	window.add(window_top_box);
+	window_top_box.set_margin_top(6);
+	window_top_box.set_margin_bottom(6);
+	window_top_box.set_margin_left(6);
+	window_top_box.set_margin_right(6);
 	window.show_all();
-
-	var using_new_payment_method = false;
-
-	NonceHandler transact = (nonce) => {
-		var sale = Sale() {
-			nonce = nonce,
-			amount = amount.text
-		};
-		bt.transaction.sale.begin(&sale, (obj, resp) => {
-			try {
-				var transaction_id = bt.transaction.sale.end(resp);
-				display_message(window_top_box, Gtk.MessageType.INFO, "Transaction ID: " + transaction_id);
-			}
-			catch (ApiError e) {
-				display_message(window_top_box, Gtk.MessageType.INFO, e.message);
-			}
-			catch (Error e) {
-				display_message(window_top_box, Gtk.MessageType.INFO, "An unexpected error occurred: " + e.message);
-			}
-			finally {
-				submit.set_sensitive(true);
-			}
-		});
-	};
-
-	submit.clicked.connect(() => {
-		submit.set_sensitive(false);
-		if (using_new_payment_method) {
-			// Create a new credit card.
-			bt.create_credit_card.begin(credit_card.parameters, (obj, resp) => {
-				credit_card.clear_errors();
-
-				try {
-					var result = bt.create_credit_card.end(resp);
-					if (result.success) {
-						transact(result.nonce);
-					} else {
-						display_message(window_top_box, Gtk.MessageType.ERROR, "Review the errors and try again.");
-						stdout.printf("No dice.\n");
-						result.errors.@foreach((error) => {
-							credit_card.show_error(error.field, error.message);
-							return true;
-						});
-						submit.set_sensitive(true);
-					}
-				}
-				catch (Error e) {
-					display_message(window_top_box, Gtk.MessageType.ERROR, "An error occurred: " + e.message);
-					submit.set_sensitive(true);
-				}
-			});
-		} else {
-			// Use an existing payment method.
-			for (var i = 0; i < bt.payment_methods.length; i++) {
-				if (bt.payment_method_buttons[i].active) {
-					transact(bt.payment_methods[i].nonce);
-					break;
-				}
-			}
-		}
-	});
-
-	bt.init.begin(GLib.Environment.get_variable("CUSTOMER_ID"), (obj, resp) => {
-		try {
-			bt.init.end(resp);
-			bt.payment_method_buttons = new Gtk.RadioButton[bt.payment_methods.length];
-			for (var i = 0; i < bt.payment_methods.length; i++) {
-				var is_default = bt.payment_methods[i].is_default;
-				var btn = new Gtk.RadioButton.with_label_from_widget(
-					bt.payment_method_buttons[0],
-					bt.payment_methods[i].type + " " + bt.payment_methods[i].description + (is_default ? " (default)" : "")
-				);
-				btn.set_always_show_image(true);
-				btn.set_image_position(Gtk.PositionType.LEFT);
-				switch (bt.payment_methods[i].type) {
-					case "CreditCard":
-						switch (bt.payment_methods[i].card_type) {
-							case "Discover":
-								btn.set_image(CreditCardLogo.discover());
-								break;
-							case "Visa":
-								btn.set_image(CreditCardLogo.visa());
-								break;
-							case "MasterCard":
-								btn.set_image(CreditCardLogo.mastercard());
-								break;
-							case "JCB":
-								btn.set_image(CreditCardLogo.jcb());
-								break;
-							case "American Express":
-								btn.set_image(CreditCardLogo.amex());
-								break;
-							default:
-								stderr.printf("unknown credit card type: %s\n", bt.payment_methods[i].card_type);
-								break;
-						}
-						break;
-				}
-				payment_methods_box.pack_start(btn, false, false, 0);
-				btn.set_active(bt.payment_methods[i].is_default);
-				bt.payment_method_buttons[i] = btn;
-			}
-			payment_methods_box.valign = Gtk.Align.CENTER;
-			window_box.pack_start(submit_box, false, false, 6);
-			window_box.show_all();
-
-			credit_card.set_challenges(bt.challenges);
-			payment_stack.set_visible_child_name("payment_methods");
-			enter_new_card.clicked.connect(() => {
-				using_new_payment_method = true;
-				payment_stack.set_visible_child_name("new_card");
-			});
-			new_payment_method_back.clicked.connect(() => {
-				using_new_payment_method = false;
-				payment_stack.set_visible_child_name("payment_methods");
-			});
-		}
-		catch (Error e) {
-			display_message(window_top_box, Gtk.MessageType.ERROR, "An error occurred: " + e.message);
-		}
-	});
 
 	Gtk.main();
 	return 0;
